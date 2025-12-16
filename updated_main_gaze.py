@@ -1407,12 +1407,10 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         
         # Record epoch statistics (NO model weights storage)
         epoch_data = stats_tracker.record_epoch(epoch, train_stats, eval_stats)
-        # Compute metrics for scheduler
+        
+        # Update learning rate scheduler based on validation loss
         metric_for_sched = eval_stats['loss']
         scheduler.step(metric_for_sched)
-        
-        # Record epoch statistics
-        epoch_data = stats_tracker.record_epoch(epoch, train_stats, eval_stats, model)
         
         # Print epoch summary
         print(f"\nEpoch {epoch+1} Summary:")
