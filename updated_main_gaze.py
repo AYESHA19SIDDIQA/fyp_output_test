@@ -27,7 +27,8 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, f1_score, precision_score, recall_score, balanced_accuracy_score, confusion_matrix
-from torch.utils.data import WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from torch.utils.data import WeightedRandomSampler, Subset
 import pandas as pd
 
 # Project path
@@ -376,9 +377,13 @@ class DataDebugger:
 # ----------------- Dataloader Builder -----------------
 def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexes=None,
                          gaze_json_dir=None, only_matched=True,
-                         suffixes_to_strip=None, **kwargs):
+                         suffixes_to_strip=None, val_split=0.1, use_train_val_split=False, **kwargs):
     """
     Build dataloaders using FilteredEEGGazeFixationDataset
+    
+    Args:
+        val_split: Fraction of training data to use for validation (default: 0.1 = 10%)
+        use_train_val_split: If True, split training data into train/val. If False, use separate eval_dir
     """
     DataDebugger.print_header("BUILD DATALOADERS (FIXED)")
     
@@ -390,6 +395,9 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
     print(f"  Train directory: {train_dir}")
     print(f"  Eval directory: {eval_dir}")
     print(f"  Gaze JSON directory: {gaze_json_dir}")
+    print(f"  Validation split ratio: {val_split}")
+    print(f"  Use train/val split: {use_train_val_split}")
+    
     # instantiate the filtered wrapper for train and eval
     dataset_kwargs = {
         'indexes': indexes,
@@ -397,7 +405,8 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
         'eeg_sampling_rate': kwargs.get('eeg_sampling_rate', 50.0)
     }
 
-    trainset = FilteredEEGGazeFixationDataset(
+    # Load full training dataset
+    full_trainset = FilteredEEGGazeFixationDataset(
         data_dir=train_dir,
         gaze_json_dir=gaze_json_dir,
         dataset_cls=EEGGazeFixationDataset,
@@ -405,7 +414,47 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
         suffixes_to_strip=suffixes_to_strip or DEFAULT_SUFFIXES_TO_STRIP
     )
 
-    labels = [trainset[i]['label'] for i in range(len(trainset))]
+    # Get labels for the full training set
+    full_labels = [full_trainset[i]['label'] for i in range(len(full_trainset))]
+    
+    if use_train_val_split:
+        # Split training data into train and validation sets
+        print(f"\n  Splitting training data: {(1-val_split)*100:.0f}% train, {val_split*100:.0f}% validation")
+        
+        # Create indices for stratified split
+        train_indices, val_indices = train_test_split(
+            range(len(full_trainset)),
+            test_size=val_split,
+            random_state=seed,
+            stratify=full_labels
+        )
+        
+        print(f"  Train indices: {len(train_indices)}, Validation indices: {len(val_indices)}")
+        
+        # Create Subset datasets
+        trainset = Subset(full_trainset, train_indices)
+        evalset = Subset(full_trainset, val_indices)
+        
+        # Get labels for train subset only
+        labels = [full_labels[i] for i in train_indices]
+        val_labels = [full_labels[i] for i in val_indices]
+        
+        print(f"  Train label distribution: {dict(Counter(labels))}")
+        print(f"  Validation label distribution: {dict(Counter(val_labels))}")
+    else:
+        # Use original behavior: separate train and eval directories
+        print(f"\n  Using separate train and eval directories")
+        trainset = full_trainset
+        labels = full_labels
+        
+        evalset = FilteredEEGGazeFixationDataset(
+            data_dir=eval_dir,
+            gaze_json_dir=gaze_json_dir,
+            dataset_cls=EEGGazeFixationDataset,
+            dataset_kwargs=dataset_kwargs,
+            suffixes_to_strip=suffixes_to_strip or DEFAULT_SUFFIXES_TO_STRIP
+        )
+
     class_counts = Counter(labels)
     num_classes = len(class_counts)
     total_samples = len(labels)
@@ -418,14 +467,6 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
 
     # Create sampler
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-
-    evalset = FilteredEEGGazeFixationDataset(
-        data_dir=eval_dir,
-        gaze_json_dir=gaze_json_dir,
-        dataset_cls=EEGGazeFixationDataset,
-        dataset_kwargs=dataset_kwargs,
-        suffixes_to_strip=suffixes_to_strip or DEFAULT_SUFFIXES_TO_STRIP
-    )
 
     # If not only_matched, you might want to use original_dataset instead; keep current behavior
     # Attach gaze_json_dir metadata on Subset-like wrappers (for downstream code)
@@ -1233,7 +1274,7 @@ def collect_and_save_attention_maps(model, eval_loader, device, output_dir='atte
 
 # ----------------- Updated Main Function -----------------
 def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1, 
-         gaze_weight=0.3, gaze_loss_type='mse'):
+         gaze_weight=0.3, gaze_loss_type='mse', val_split=0.1, use_train_val_split=True):
     """
     Parameterized main training function.
     
@@ -1244,6 +1285,8 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         accum_iter: Gradient accumulation steps
         gaze_weight: Weight for gaze loss (0 = no gaze supervision)
         gaze_loss_type: Type of gaze loss ('mse', 'weighted_mse', 'cosine', 'kl', 'combined')
+        val_split: Fraction of training data to use for validation (default: 0.1 = 10%)
+        use_train_val_split: If True, split training data into train/val. If False, use separate eval_dir
     """
     DataDebugger.print_header("GAZE-GUIDED ATTENTION TRAINING WITH COMPREHENSIVE TRACKING", width=80)
     
@@ -1255,6 +1298,8 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     print(f"  Accumulation steps: {accum_iter}")
     print(f"  Gaze weight: {gaze_weight}")
     print(f"  Gaze loss type: {gaze_loss_type}")
+    print(f"  Validation split: {val_split * 100:.0f}%")
+    print(f"  Use train/val split: {use_train_val_split}")
     
     device = def_dev()
     print(f"\nDevice: {device}")
@@ -1284,7 +1329,9 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
             gaze_json_dir=gaze_json_dir,
             only_matched=True,
             suffixes_to_strip=DEFAULT_SUFFIXES_TO_STRIP,
-            eeg_sampling_rate=50.0
+            eeg_sampling_rate=50.0,
+            val_split=val_split,
+            use_train_val_split=use_train_val_split
         )
     except Exception as e:
         print("Error building dataloaders:", e)
@@ -1522,6 +1569,12 @@ if __name__ == "__main__":
         choices=["mse", "combined", "cosine"],
         help="Type of gaze supervision loss"
     )
+    parser.add_argument("--val-split", type=float, default=0.1, 
+                       help="Fraction of training data to use for validation (default: 0.1 = 10%%)")
+    parser.add_argument("--use-train-val-split", action="store_true", default=True,
+                       help="Split training data into train/val (default: True)")
+    parser.add_argument("--no-train-val-split", dest="use_train_val_split", action="store_false",
+                       help="Use separate eval directory instead of splitting training data")
 
     args = parser.parse_args()
 
@@ -1533,4 +1586,6 @@ if __name__ == "__main__":
         accum_iter=args.accum_iter,
         gaze_weight=args.gaze_weight,
         gaze_loss_type=args.gaze_loss_type,
+        val_split=args.val_split,
+        use_train_val_split=args.use_train_val_split,
     )
