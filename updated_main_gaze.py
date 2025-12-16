@@ -377,26 +377,29 @@ class DataDebugger:
 # ----------------- Dataloader Builder -----------------
 def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexes=None,
                          gaze_json_dir=None, only_matched=True,
-                         suffixes_to_strip=None, val_split=0.1, use_train_val_split=False, **kwargs):
+                         suffixes_to_strip=None, val_split=0.1, **kwargs):
     """
     Build dataloaders using FilteredEEGGazeFixationDataset
     
+    Returns 3 loaders: train_loader, val_loader, test_loader
+    - train_loader: Training data (after splitting out validation)
+    - val_loader: Validation data split from training data (for hyperparameter tuning, LR scheduling, checkpoint saving)
+    - test_loader: Separate test data from eval directory (for FINAL evaluation only)
+    
     Args:
         val_split: Fraction of training data to use for validation (default: 0.1 = 10%)
-        use_train_val_split: If True, split training data into train/val. If False, use separate eval_dir
     """
-    DataDebugger.print_header("BUILD DATALOADERS (FIXED)")
+    DataDebugger.print_header("BUILD DATALOADERS (FIXED) - Train/Val/Test Split")
     
     # Use configurable subdirectories
     train_dir = os.path.join(data_dir, kwargs.get('train_subdir', 'train'))
-    eval_dir = os.path.join(data_dir, kwargs.get('eval_subdir', 'eval'))
+    test_dir = os.path.join(data_dir, kwargs.get('eval_subdir', 'eval'))  # This is the TEST set
     
     print(f"  Main data_dir: {data_dir}")
     print(f"  Train directory: {train_dir}")
-    print(f"  Eval directory: {eval_dir}")
+    print(f"  Test directory: {test_dir} (for FINAL evaluation only)")
     print(f"  Gaze JSON directory: {gaze_json_dir}")
-    print(f"  Validation split ratio: {val_split}")
-    print(f"  Use train/val split: {use_train_val_split}")
+    print(f"  Validation split ratio: {val_split} (split from training data)")
     
     # instantiate the filtered wrapper for train and eval
     dataset_kwargs = {
@@ -417,63 +420,53 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
     # Get labels for the full training set
     full_labels = [full_trainset[i]['label'] for i in range(len(full_trainset))]
     
-    if use_train_val_split:
-        # Split training data into train and validation sets
-        print(f"\n  Splitting training data: {(1-val_split)*100:.0f}% train, {val_split*100:.0f}% validation")
-        
-        # Create indices for stratified split
-        train_indices, val_indices = train_test_split(
-            range(len(full_trainset)),
-            test_size=val_split,
-            random_state=seed,
-            stratify=full_labels
-        )
-        
-        print(f"  Train indices: {len(train_indices)}, Validation indices: {len(val_indices)}")
-        
-        # Create Subset datasets
-        trainset = Subset(full_trainset, train_indices)
-        evalset = Subset(full_trainset, val_indices)
-        
-        # Get labels for train subset only
-        labels = [full_labels[i] for i in train_indices]
-        val_labels = [full_labels[i] for i in val_indices]
-        
-        print(f"  Train label distribution: {dict(Counter(labels))}")
-        print(f"  Validation label distribution: {dict(Counter(val_labels))}")
-    else:
-        # Use original behavior: separate train and eval directories
-        print(f"\n  Using separate train and eval directories")
-        trainset = full_trainset
-        labels = full_labels
-        
-        evalset = FilteredEEGGazeFixationDataset(
-            data_dir=eval_dir,
-            gaze_json_dir=gaze_json_dir,
-            dataset_cls=EEGGazeFixationDataset,
-            dataset_kwargs=dataset_kwargs,
-            suffixes_to_strip=suffixes_to_strip or DEFAULT_SUFFIXES_TO_STRIP
-        )
+    # ALWAYS split training data into train and validation sets
+    print(f"\n  Splitting training data: {(1-val_split)*100:.0f}% train, {val_split*100:.0f}% validation")
+    
+    # Create indices for stratified split
+    train_indices, val_indices = train_test_split(
+        range(len(full_trainset)),
+        test_size=val_split,
+        random_state=seed,
+        stratify=full_labels
+    )
+    
+    print(f"  Train indices: {len(train_indices)}, Validation indices: {len(val_indices)}")
+    
+    # Create Subset datasets
+    trainset = Subset(full_trainset, train_indices)
+    valset = Subset(full_trainset, val_indices)
+    
+    # Get labels for train and val subsets
+    labels = [full_labels[i] for i in train_indices]
+    val_labels = [full_labels[i] for i in val_indices]
+    
+    print(f"  Train label distribution: {dict(Counter(labels))}")
+    print(f"  Validation label distribution: {dict(Counter(val_labels))}")
+    
+    # Load separate TEST dataset (from eval directory)
+    print(f"\n  Loading separate TEST set from: {test_dir}")
+    testset = FilteredEEGGazeFixationDataset(
+        data_dir=test_dir,
+        gaze_json_dir=gaze_json_dir,
+        dataset_cls=EEGGazeFixationDataset,
+        dataset_kwargs=dataset_kwargs,
+        suffixes_to_strip=suffixes_to_strip or DEFAULT_SUFFIXES_TO_STRIP
+    )
+    test_labels = [testset[i]['label'] for i in range(len(testset))]
+    print(f"  Test label distribution: {dict(Counter(test_labels))}")
 
     class_counts = Counter(labels)
     num_classes = len(class_counts)
     total_samples = len(labels)
-    print(f"\n  Training label distribution: {dict(class_counts)}")
-    print(f"  Number of classes: {num_classes}, Total training samples: {total_samples}")
+    print(f"\n  Number of classes: {num_classes}, Total training samples: {total_samples}")
     class_weights = {cls: total_samples / count for cls, count in class_counts.items()}
 
     # Assign a weight to each sample
     sample_weights = [class_weights[label] for label in labels]
 
-    # Create sampler
+    # Create sampler for training data only
     sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-
-    # If not only_matched, you might want to use original_dataset instead; keep current behavior
-    # Attach gaze_json_dir metadata on Subset-like wrappers (for downstream code)
-    for ds in (trainset, evalset):
-        # if ds is a wrapper with original_dataset attribute and not Subset, set attribute on wrapper
-        if hasattr(ds, 'gaze_json_dir'):
-            ds.gaze_json_dir = gaze_json_dir
 
     # Create DataLoaders
     def worker_init_fn(worker_id):
@@ -490,9 +483,19 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
         drop_last=False
     )
 
-    eval_loader = torch.utils.data.DataLoader(
-        evalset,
-        batch_size=min(batch_size, len(evalset)) if len(evalset) > 0 else 1,
+    val_loader = torch.utils.data.DataLoader(
+        valset,
+        batch_size=min(batch_size, len(valset)) if len(valset) > 0 else 1,
+        shuffle=False,
+        num_workers=0,
+        worker_init_fn=worker_init_fn,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        testset,
+        batch_size=min(batch_size, len(testset)) if len(testset) > 0 else 1,
         shuffle=False,
         num_workers=0,
         worker_init_fn=worker_init_fn,
@@ -502,17 +505,24 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
 
     print("\nDATALOADER SUMMARY")
     print(f"  Train samples: {len(trainset)} | batches: {len(train_loader)}")
-    print(f"  Eval samples:  {len(evalset)} | batches: {len(eval_loader)}")
+    print(f"  Validation samples: {len(valset)} | batches: {len(val_loader)}")
+    print(f"  Test samples: {len(testset)} | batches: {len(test_loader)}")
+    print(f"\n  IMPORTANT: ")
+    print(f"    - Use val_loader for: LR scheduling, checkpoint saving, early stopping")
+    print(f"    - Use test_loader ONLY for: Final evaluation at the end")
 
     # Quick dataset diagnostics
     DataDebugger.analyze_dataset(trainset, "Filtered Train Dataset", max_samples=5)
-    DataDebugger.analyze_dataset(evalset, "Filtered Eval Dataset", max_samples=5)
+    DataDebugger.analyze_dataset(valset, "Filtered Validation Dataset", max_samples=5)
+    DataDebugger.analyze_dataset(testset, "Filtered Test Dataset", max_samples=5)
 
-    return train_loader, eval_loader, {
+    return train_loader, val_loader, test_loader, {
         'train_filtered': len(trainset),
-        'eval_filtered': len(evalset),
-        'train_disk_matched': len(trainset.disk_matched_basenames) if hasattr(trainset, 'disk_matched_basenames') else 0,
-        'eval_disk_matched': len(evalset.disk_matched_basenames) if hasattr(evalset, 'disk_matched_basenames') else 0
+        'val_filtered': len(valset),
+        'test_filtered': len(testset),
+        'train_disk_matched': len(trainset.original_dataset.disk_matched_basenames) if hasattr(trainset, 'dataset') and hasattr(trainset.dataset, 'disk_matched_basenames') else 0,
+        'val_disk_matched': len(valset.original_dataset.disk_matched_basenames) if hasattr(valset, 'dataset') and hasattr(valset.dataset, 'disk_matched_basenames') else 0,
+        'test_disk_matched': len(testset.disk_matched_basenames) if hasattr(testset, 'disk_matched_basenames') else 0
     }
 
 # ----------------- Storage Invariants and Contracts -----------------
@@ -702,14 +712,15 @@ class TrainingStatistics:
         self.run_dir = self.output_dir / f"run_{self.timestamp}"
         self.run_dir.mkdir(exist_ok=True, parents=True)
         
-    def record_epoch(self, epoch, train_stats, eval_stats):
+    def record_epoch(self, epoch, train_stats, val_stats, test_stats=None):
         """
-        Record epoch-level statistics.
+        Record epoch-level statistics for train/val/test splits.
         
         Args:
             epoch: Current epoch number
             train_stats: Dictionary of training metrics
-            eval_stats: Dictionary of evaluation metrics
+            val_stats: Dictionary of validation metrics
+            test_stats: Optional dictionary of test metrics (only for final evaluation)
         
         Returns:
             Recorded epoch data dictionary
@@ -720,21 +731,35 @@ class TrainingStatistics:
             'train_cls_loss': train_stats.get('cls_loss', 0),
             'train_gaze_loss': train_stats.get('gaze_loss', 0),
             'train_acc': train_stats.get('acc', 0),
-            'eval_acc': eval_stats.get('acc', 0),
-            'eval_loss': eval_stats.get('loss', 0),
-            'eval_cls_loss': eval_stats.get('cls_loss', 0),
-            'eval_gaze_loss': eval_stats.get('gaze_loss', 0),
-            'eval_macro_f1': eval_stats.get('macro_f1', 0),
-            'eval_balanced_acc': eval_stats.get('balanced_acc', 0),
-            'eval_weighted_f1': eval_stats.get('weighted_f1', 0),
-            'eval_precision': eval_stats.get('precision', 0),
-            'eval_recall': eval_stats.get('recall', 0),
+            'val_acc': val_stats.get('acc', 0),
+            'val_loss': val_stats.get('loss', 0),
+            'val_cls_loss': val_stats.get('cls_loss', 0),
+            'val_gaze_loss': val_stats.get('gaze_loss', 0),
+            'val_macro_f1': val_stats.get('macro_f1', 0),
+            'val_balanced_acc': val_stats.get('balanced_acc', 0),
+            'val_weighted_f1': val_stats.get('weighted_f1', 0),
+            'val_precision': val_stats.get('precision', 0),
+            'val_recall': val_stats.get('recall', 0),
             'lr': train_stats.get('lr', 0),
             'train_gaze_batches': train_stats.get('gaze_batches', 0),
             'train_gaze_samples': train_stats.get('gaze_samples', 0),
-            'eval_gaze_batches': eval_stats.get('gaze_batches', 0),
+            'val_gaze_batches': val_stats.get('gaze_batches', 0),
             'timestamp': datetime.now().isoformat()
         }
+        
+        # Add test stats if provided (only for final evaluation)
+        if test_stats:
+            epoch_data['test_acc'] = test_stats.get('acc', 0)
+            epoch_data['test_loss'] = test_stats.get('loss', 0)
+            epoch_data['test_cls_loss'] = test_stats.get('cls_loss', 0)
+            epoch_data['test_gaze_loss'] = test_stats.get('gaze_loss', 0)
+            epoch_data['test_macro_f1'] = test_stats.get('macro_f1', 0)
+            epoch_data['test_balanced_acc'] = test_stats.get('balanced_acc', 0)
+            epoch_data['test_weighted_f1'] = test_stats.get('weighted_f1', 0)
+            epoch_data['test_precision'] = test_stats.get('precision', 0)
+            epoch_data['test_recall'] = test_stats.get('recall', 0)
+            epoch_data['test_gaze_batches'] = test_stats.get('gaze_batches', 0)
+        
         self.epoch_stats.append(epoch_data)
         
         # Save intermediate results (CSV only, no large objects)
@@ -897,31 +922,36 @@ class TrainingStatistics:
         # Accuracy curves
         ax = axes[0, 1]
         ax.plot(epochs, [s['train_acc'] for s in self.epoch_stats], label='Train Accuracy', linewidth=2)
-        ax.plot(epochs, [s['eval_acc'] for s in self.epoch_stats], label='Eval Accuracy', linewidth=2)
+        ax.plot(epochs, [s['val_acc'] for s in self.epoch_stats], label='Val Accuracy', linewidth=2)
+        # Plot test accuracy if available
+        if 'test_acc' in self.epoch_stats[-1]:
+            test_accs = [s.get('test_acc', None) for s in self.epoch_stats]
+            if any(ta is not None for ta in test_accs):
+                ax.plot(epochs, test_accs, label='Test Accuracy', linewidth=2, linestyle=':')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Accuracy (%)')
-        ax.set_title('Training vs Evaluation Accuracy')
+        ax.set_title('Train vs Validation vs Test Accuracy')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
         # F1 scores
         ax = axes[1, 0]
-        ax.plot(epochs, [s['eval_macro_f1'] for s in self.epoch_stats], label='Macro F1', linewidth=2)
-        ax.plot(epochs, [s['eval_weighted_f1'] for s in self.epoch_stats], label='Weighted F1', linestyle='--')
-        ax.plot(epochs, [s['eval_balanced_acc'] for s in self.epoch_stats], label='Balanced Acc', linestyle=':')
+        ax.plot(epochs, [s['val_macro_f1'] for s in self.epoch_stats], label='Val Macro F1', linewidth=2)
+        ax.plot(epochs, [s['val_weighted_f1'] for s in self.epoch_stats], label='Val Weighted F1', linestyle='--')
+        ax.plot(epochs, [s['val_balanced_acc'] for s in self.epoch_stats], label='Val Balanced Acc', linestyle=':')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Score')
-        ax.set_title('Evaluation Metrics')
+        ax.set_title('Validation Metrics')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
         # Precision-Recall
         ax = axes[1, 1]
-        ax.plot(epochs, [s['eval_precision'] for s in self.epoch_stats], label='Precision', linewidth=2)
-        ax.plot(epochs, [s['eval_recall'] for s in self.epoch_stats], label='Recall', linestyle='--')
+        ax.plot(epochs, [s['val_precision'] for s in self.epoch_stats], label='Val Precision', linewidth=2)
+        ax.plot(epochs, [s['val_recall'] for s in self.epoch_stats], label='Val Recall', linestyle='--')
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Score')
-        ax.set_title('Precision and Recall')
+        ax.set_title('Validation Precision and Recall')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
@@ -1274,9 +1304,14 @@ def collect_and_save_attention_maps(model, eval_loader, device, output_dir='atte
 
 # ----------------- Updated Main Function -----------------
 def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1, 
-         gaze_weight=0.3, gaze_loss_type='mse', val_split=0.1, use_train_val_split=True):
+         gaze_weight=0.3, gaze_loss_type='mse', val_split=0.1):
     """
     Parameterized main training function.
+    
+    Returns 3 loaders: train_loader, val_loader, test_loader
+    - train_loader: Training data (for learning)
+    - val_loader: Validation data (for hyperparameter tuning, LR scheduling, checkpoint saving)
+    - test_loader: Test data (for FINAL evaluation only, no training decisions)
     
     Args:
         lr: Learning rate
@@ -1286,7 +1321,6 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         gaze_weight: Weight for gaze loss (0 = no gaze supervision)
         gaze_loss_type: Type of gaze loss ('mse', 'weighted_mse', 'cosine', 'kl', 'combined')
         val_split: Fraction of training data to use for validation (default: 0.1 = 10%)
-        use_train_val_split: If True, split training data into train/val. If False, use separate eval_dir
     """
     DataDebugger.print_header("GAZE-GUIDED ATTENTION TRAINING WITH COMPREHENSIVE TRACKING", width=80)
     
@@ -1298,8 +1332,12 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     print(f"  Accumulation steps: {accum_iter}")
     print(f"  Gaze weight: {gaze_weight}")
     print(f"  Gaze loss type: {gaze_loss_type}")
-    print(f"  Validation split: {val_split * 100:.0f}%")
-    print(f"  Use train/val split: {use_train_val_split}")
+    print(f"  Validation split: {val_split * 100:.0f}% (from training data)")
+    print(f"\n  Data Split Strategy:")
+    print(f"    1. Split training directory: {(1-val_split)*100:.0f}% train, {val_split*100:.0f}% validation")
+    print(f"    2. Separate test directory: Used ONLY for final evaluation")
+    print(f"    3. Validation set: Used for LR scheduling, checkpoint saving, early stopping")
+    print(f"    4. Test set: NOT used for any training decisions")
     
     device = def_dev()
     print(f"\nDevice: {device}")
@@ -1321,7 +1359,7 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     
     # Build dataloaders
     try:
-        train_loader, eval_loader, gaze_stats = get_dataloaders_fixed(
+        train_loader, val_loader, test_loader, gaze_stats = get_dataloaders_fixed(
             data_dir=data_dir,
             batch_size=hyps['batch_size'],
             seed=42,
@@ -1330,8 +1368,7 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
             only_matched=True,
             suffixes_to_strip=DEFAULT_SUFFIXES_TO_STRIP,
             eeg_sampling_rate=50.0,
-            val_split=val_split,
-            use_train_val_split=use_train_val_split
+            val_split=val_split
         )
     except Exception as e:
         print("Error building dataloaders:", e)
@@ -1341,10 +1378,12 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     # Record initial class distributions
     print("\nRecording initial class distributions...")
     train_dist = stats_tracker.record_class_distribution(train_loader, "train")
-    eval_dist = stats_tracker.record_class_distribution(eval_loader, "eval")
+    val_dist = stats_tracker.record_class_distribution(val_loader, "val")
+    test_dist = stats_tracker.record_class_distribution(test_loader, "test")
     
     print(f"  Train distribution: {dict(train_dist)}")
-    print(f"  Eval distribution: {dict(eval_dist)}")
+    print(f"  Validation distribution: {dict(val_dist)}")
+    print(f"  Test distribution: {dict(test_dist)}")
     
     # Model
     try:
@@ -1400,50 +1439,51 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
             epoch=epoch
         )
         
-        # Evaluate
-        eval_stats, ev_labels, ev_preds, ev_files = evaluate_model_comprehensive(
-            model, eval_loader, device, stats_tracker, "eval"
+        # Evaluate on VALIDATION set (for training decisions)
+        val_stats, val_labels, val_preds, val_files = evaluate_model_comprehensive(
+            model, val_loader, device, stats_tracker, "val"
         )
         
         # Record epoch statistics (NO model weights storage)
-        epoch_data = stats_tracker.record_epoch(epoch, train_stats, eval_stats)
+        epoch_data = stats_tracker.record_epoch(epoch, train_stats, val_stats)
         
-        # Update learning rate scheduler based on validation loss
-        metric_for_sched = eval_stats['loss']
+        # Update learning rate scheduler based on VALIDATION loss (NOT test loss!)
+        metric_for_sched = val_stats['loss']
         scheduler.step(metric_for_sched)
         
         # Print epoch summary
         print(f"\nEpoch {epoch+1} Summary:")
         print(f"  Train: Loss={train_stats['loss']:.4f} (CLS={train_stats['cls_loss']:.4f}, "
               f"Gaze={train_stats['gaze_loss']:.4f}) | Acc={train_stats['acc']:.2f}%")
-        print(f"  Eval:  Loss={eval_stats['loss']:.4f} (CLS={eval_stats['cls_loss']:.4f}, "
-              f"Gaze={eval_stats['gaze_loss']:.4f}) | Acc={eval_stats['acc']:.2f}% | "
-              f"Balanced Acc={eval_stats['balanced_acc']:.4f} | "
-              f"Macro F1={eval_stats['macro_f1']:.4f}")
+        print(f"  Val:   Loss={val_stats['loss']:.4f} (CLS={val_stats['cls_loss']:.4f}, "
+              f"Gaze={val_stats['gaze_loss']:.4f}) | Acc={val_stats['acc']:.2f}% | "
+              f"Balanced Acc={val_stats['balanced_acc']:.4f} | "
+              f"Macro F1={val_stats['macro_f1']:.4f}")
         print(f"  Gaze:  {train_stats['gaze_samples']}/{train_stats['total_samples']} samples (train), "
-              f"{eval_stats['gaze_batches']}/{len(eval_loader)} batches (eval)")
+              f"{val_stats['gaze_batches']}/{len(val_loader)} batches (val)")
         print(f"  LR:    {train_stats['lr']:.2e}")
 
         
-        # Detailed classification report
-        print("\nClassification Report:")
-        print(classification_report(ev_labels, ev_preds, digits=4))
-        # Track best metrics
-        if eval_stats['acc'] > best_acc:
-            best_acc = eval_stats['acc']
+        # Detailed classification report for validation set
+        print("\nValidation Classification Report:")
+        print(classification_report(val_labels, val_preds, digits=4))
         
-        # Save SINGLE authoritative checkpoint (based on validation loss)
-        if eval_stats['loss'] < best_loss:
-            best_loss = eval_stats['loss']
+        # Track best metrics based on VALIDATION set
+        if val_stats['acc'] > best_acc:
+            best_acc = val_stats['acc']
+        
+        # Save SINGLE authoritative checkpoint (based on VALIDATION loss, NOT test loss!)
+        if val_stats['loss'] < best_loss:
+            best_loss = val_stats['loss']
             checkpoint_path = stats_tracker.run_dir / 'best_model.pth'
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_stats['loss'],
-                'eval_loss': eval_stats['loss'],
-                'eval_acc': eval_stats['acc'],
-                'eval_f1': eval_stats['macro_f1'],
+                'val_loss': val_stats['loss'],
+                'val_acc': val_stats['acc'],
+                'val_f1': val_stats['macro_f1'],
             }, checkpoint_path)
             print(f"  ✓ Saved best model checkpoint (val_loss: {best_loss:.4f}, epoch: {epoch+1})")
     
@@ -1453,11 +1493,49 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         if checkpoint_path.exists():
             checkpoint = torch.load(checkpoint_path)
             model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"\n✓ Loaded best model checkpoint from epoch {checkpoint['epoch']}")
-            print(f"  Validation loss: {checkpoint['eval_loss']:.4f}")
-            print(f"  Validation accuracy: {checkpoint['eval_acc']:.2f}%")
+            print(f"\n✓ Loaded best model checkpoint from epoch {checkpoint['epoch']+1}")
+            print(f"  Validation loss: {checkpoint['val_loss']:.4f}")
+            print(f"  Validation accuracy: {checkpoint['val_acc']:.2f}%")
     except Exception as e:
         print(f"Warning: Could not load best model checkpoint: {e}")
+    
+    # FINAL EVALUATION ON TEST SET (no training decisions based on this!)
+    print("\n" + "=" * 80)
+    print("FINAL EVALUATION ON TEST SET")
+    print("=" * 80)
+    print("NOTE: This is the FIRST and ONLY time we evaluate on the test set!")
+    print("      The test set was NOT used for any training decisions.")
+    
+    test_stats, test_labels, test_preds, test_files = evaluate_model_comprehensive(
+        model, test_loader, device, stats_tracker, "test"
+    )
+    
+    print(f"\nFinal Test Results:")
+    print(f"  Test Loss: {test_stats['loss']:.4f} (CLS={test_stats['cls_loss']:.4f}, "
+          f"Gaze={test_stats['gaze_loss']:.4f})")
+    print(f"  Test Accuracy: {test_stats['acc']:.2f}%")
+    print(f"  Test Balanced Accuracy: {test_stats['balanced_acc']:.4f}")
+    print(f"  Test Macro F1: {test_stats['macro_f1']:.4f}")
+    print(f"  Test Weighted F1: {test_stats['weighted_f1']:.4f}")
+    print(f"  Test Precision: {test_stats['precision']:.4f}")
+    print(f"  Test Recall: {test_stats['recall']:.4f}")
+    
+    print("\nFinal Test Classification Report:")
+    print(classification_report(test_labels, test_preds, digits=4))
+    
+    # Record final test statistics in the last epoch
+    if stats_tracker.epoch_stats:
+        last_epoch = stats_tracker.epoch_stats[-1]
+        last_epoch['test_acc'] = test_stats['acc']
+        last_epoch['test_loss'] = test_stats['loss']
+        last_epoch['test_cls_loss'] = test_stats['cls_loss']
+        last_epoch['test_gaze_loss'] = test_stats['gaze_loss']
+        last_epoch['test_macro_f1'] = test_stats['macro_f1']
+        last_epoch['test_balanced_acc'] = test_stats['balanced_acc']
+        last_epoch['test_weighted_f1'] = test_stats['weighted_f1']
+        last_epoch['test_precision'] = test_stats['precision']
+        last_epoch['test_recall'] = test_stats['recall']
+        last_epoch['test_gaze_batches'] = test_stats['gaze_batches']
     
     # Save training statistics
     print("\n" + "=" * 80)
@@ -1465,14 +1543,14 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     print("=" * 80)
     stats_tracker.save_final_results()
     
-    # Collect and save attention maps SEPARATELY (memory-efficient)
+    # Collect and save attention maps SEPARATELY (memory-efficient) from TEST set
     print("\n" + "=" * 80)
-    print("COLLECTING AND SAVING ATTENTION MAPS")
+    print("COLLECTING AND SAVING ATTENTION MAPS FROM TEST SET")
     print("=" * 80)
     
     attention_storage = collect_and_save_attention_maps(
         model=model,
-        eval_loader=eval_loader,
+        eval_loader=test_loader,  # Use test_loader for attention map collection
         device=device,
         output_dir=stats_tracker.run_dir / 'attention_maps'
     )
@@ -1487,7 +1565,9 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         f.write(f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total epochs: {len(stats_tracker.epoch_stats)}\n")
         f.write(f"Best validation accuracy: {best_acc:.2f}%\n")
-        f.write(f"Best validation loss: {best_loss:.4f}\n\n")
+        f.write(f"Best validation loss: {best_loss:.4f}\n")
+        f.write(f"Final test accuracy: {test_stats['acc']:.2f}%\n")
+        f.write(f"Final test loss: {test_stats['loss']:.4f}\n\n")
         
         f.write("TRAINING PARAMETERS\n")
         f.write("-" * 40 + "\n")
@@ -1501,21 +1581,31 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         f.write("DATASET STATISTICS\n")
         f.write("-" * 40 + "\n")
         f.write(f"  Train samples: {len(train_loader.dataset)}\n")
-        f.write(f"  Eval samples: {len(eval_loader.dataset)}\n")
+        f.write(f"  Validation samples: {len(val_loader.dataset)}\n")
+        f.write(f"  Test samples: {len(test_loader.dataset)}\n")
         f.write(f"  Train class distribution: {dict(train_dist)}\n")
-        f.write(f"  Eval class distribution: {dict(eval_dist)}\n\n")
+        f.write(f"  Validation class distribution: {dict(val_dist)}\n")
+        f.write(f"  Test class distribution: {dict(test_dist)}\n\n")
+        f.write("DATA USAGE\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"  ✓ Train set: Used for model training\n")
+        f.write(f"  ✓ Validation set: Used for LR scheduling, checkpoint saving, early stopping\n")
+        f.write(f"  ✓ Test set: Used ONLY for final evaluation (no training decisions)\n\n")
         
         f.write("STORAGE ARCHITECTURE\n")
         f.write("-" * 40 + "\n")
         f.write(f"  Training stats: {stats_tracker.run_dir}\n")
-        f.write(f"    - epoch_statistics.csv (epoch-level metrics)\n")
-        f.write(f"    - predictions_eval.csv (per-sample predictions)\n")
-        f.write(f"    - confusion_matrices.json (evaluation confusion matrices)\n")
+        f.write(f"    - epoch_statistics.csv (epoch-level metrics for train/val/test)\n")
+        f.write(f"    - predictions_train.csv (per-sample predictions for training)\n")
+        f.write(f"    - predictions_val.csv (per-sample predictions for validation)\n")
+        f.write(f"    - predictions_test.csv (per-sample predictions for test)\n")
+        f.write(f"    - confusion_matrices.json (confusion matrices for train/val/test)\n")
         f.write(f"    - training_curves.png (loss/accuracy plots)\n")
         f.write(f"  Model checkpoint: {checkpoint_path}\n")
+        f.write(f"    - Selected based on VALIDATION loss (not test loss!)\n")
         f.write(f"  Attention maps: {attention_storage.output_dir}\n")
         f.write(f"    - Format: Compressed NPZ (one file per sample)\n")
-        f.write(f"    - Count: {attention_storage.metadata['n_samples']} maps\n")
+        f.write(f"    - Count: {attention_storage.metadata['n_samples']} maps (from test set)\n")
         f.write(f"    - Shape per map: {attention_storage.metadata['expected_shape']}\n\n")
         
         f.write("DESIGN PRINCIPLES\n")
@@ -1540,11 +1630,20 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
     print("=" * 80)
     print(f"Best validation accuracy: {best_acc:.2f}%")
     print(f"Best validation loss: {best_loss:.4f}")
+    print(f"Final test accuracy: {test_stats['acc']:.2f}%")
+    print(f"Final test loss: {test_stats['loss']:.4f}")
     print(f"\nResults saved to: {stats_tracker.run_dir}")
-    print(f"  - Training statistics: epoch_statistics.csv, predictions_eval.csv")
-    print(f"  - Model checkpoint: best_model.pth")
-    print(f"  - Attention maps: attention_maps/ ({attention_storage.metadata['n_samples']} files)")
+    print(f"  - Training statistics: epoch_statistics.csv")
+    print(f"  - Predictions: predictions_train.csv, predictions_val.csv, predictions_test.csv")
+    print(f"  - Model checkpoint: best_model.pth (selected based on validation loss)")
+    print(f"  - Attention maps: attention_maps/ ({attention_storage.metadata['n_samples']} files from test set)")
     print(f"  - Summary: training_summary.txt")
+    print("\n" + "=" * 80)
+    print("DATA SPLIT VERIFICATION")
+    print("=" * 80)
+    print("✓ Training data: Used for learning")
+    print("✓ Validation data: Used for LR scheduling, checkpoint saving (NO TEST DATA LEAKAGE!)")
+    print("✓ Test data: Used ONLY for final evaluation (NO TRAINING DECISIONS!)")
     print("=" * 80)
     
     return best_acc, stats_tracker.run_dir
@@ -1569,10 +1668,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--val-split", type=float, default=0.1, 
                        help="Fraction of training data to use for validation (default: 0.1 = 10%%)")
-    parser.add_argument("--use-train-val-split", action="store_true", default=True,
-                       help="Split training data into train/val (default: True)")
-    parser.add_argument("--no-train-val-split", dest="use_train_val_split", action="store_false",
-                       help="Use separate eval directory instead of splitting training data")
 
     args = parser.parse_args()
 
@@ -1585,5 +1680,4 @@ if __name__ == "__main__":
         gaze_weight=args.gaze_weight,
         gaze_loss_type=args.gaze_loss_type,
         val_split=args.val_split,
-        use_train_val_split=args.use_train_val_split,
     )
