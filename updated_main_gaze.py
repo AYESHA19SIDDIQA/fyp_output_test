@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Updated training script with enhanced tracking and storage capabilities:
-1. Stores attention maps for all samples after training
-2. Tracks comprehensive training statistics (losses, metrics, class distribution, weights)
-3. Saves all results for later analysis and visualization
+Refactored training script with clean data-saving architecture:
+1. Separates training statistics from analysis artifacts
+2. Uses memory-efficient storage formats (NPZ for attention maps)
+3. Eliminates duplicate storage
+4. Single authoritative model checkpoint
+5. Clear separation of concerns
+
+Storage Strategy:
+- Training stats: CSV files for metrics, JSON for metadata
+- Attention maps: Compressed NPZ files with one file per sample
+- Model checkpoint: Single best_model.pth based on validation loss
 """
 
 import os
 import sys
 import json
-import pickle
 import traceback
 from datetime import datetime
 from collections import defaultdict, Counter
@@ -468,31 +474,205 @@ def get_dataloaders_fixed(data_dir, batch_size, seed, target_length=None, indexe
         'eval_disk_matched': len(evalset.disk_matched_basenames) if hasattr(evalset, 'disk_matched_basenames') else 0
     }
 
+# ----------------- Storage Invariants and Contracts -----------------
+"""
+ATTENTION MAP STORAGE INVARIANTS:
+1. Shape: (n_channels, n_timepoints) where n_channels=22, n_timepoints=15000
+2. Dtype: float32 (4 bytes per value)
+3. Range: [0, 1] after normalization (clipped if needed)
+4. Format: Compressed NPZ (numpy.savez_compressed)
+5. Naming: {file_identifier}_attention.npz
+6. Content keys: 'attention_map', 'file_id', 'shape', 'sampling_rate'
+
+TRAINING STATISTICS INVARIANTS:
+1. Epoch stats: CSV with one row per epoch
+2. Predictions: CSV with one row per sample
+3. Confusion matrices: JSON-serializable lists
+4. No duplicate storage of any data
+5. No pickle for large arrays
+
+MODEL CHECKPOINT INVARIANTS:
+1. Single checkpoint: best_model.pth (lowest validation loss)
+2. Contains: model_state_dict, optimizer_state_dict, epoch, metrics
+3. Saved only when validation loss improves
+"""
+
+# ----------------- Attention Map Storage -----------------
+class AttentionMapStorage:
+    """
+    Memory-efficient storage for attention maps using compressed NPZ format.
+    Eliminates pickle and duplicate storage.
+    """
+    
+    def __init__(self, output_dir='attention_maps'):
+        """
+        Args:
+            output_dir: Directory to store attention maps (one file per sample)
+        """
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Metadata tracking
+        self.metadata = {
+            'n_samples': 0,
+            'expected_shape': (22, 15000),
+            'dtype': 'float32',
+            'sampling_rate': 50.0,
+            'created': datetime.now().isoformat()
+        }
+        
+        self.file_manifest = []
+    
+    def save_attention_map(self, attention_map, file_identifier, validate=True):
+        """
+        Save a single attention map to disk.
+        
+        Args:
+            attention_map: numpy array of shape (n_channels, n_timepoints)
+            file_identifier: unique identifier for this sample (filename)
+            validate: whether to validate shape and range
+        
+        Returns:
+            Path to saved file
+        """
+        # Validate if requested
+        if validate:
+            if not isinstance(attention_map, np.ndarray):
+                attention_map = attention_map.cpu().numpy() if torch.is_tensor(attention_map) else np.array(attention_map)
+            
+            # Check shape
+            expected_shape = self.metadata['expected_shape']
+            if attention_map.shape != expected_shape:
+                raise ValueError(f"Attention map shape {attention_map.shape} doesn't match expected {expected_shape}")
+            
+            # Check dtype
+            if attention_map.dtype != np.float32:
+                attention_map = attention_map.astype(np.float32)
+            
+            # Ensure range [0, 1]
+            attention_map = np.clip(attention_map, 0.0, 1.0)
+        
+        # Create filename (sanitize file_identifier)
+        safe_identifier = os.path.basename(file_identifier).replace('.npz', '').replace('.json', '')
+        output_file = self.output_dir / f"{safe_identifier}_attention.npz"
+        
+        # Save with compression
+        np.savez_compressed(
+            output_file,
+            attention_map=attention_map,
+            file_id=file_identifier,
+            shape=attention_map.shape,
+            sampling_rate=self.metadata['sampling_rate']
+        )
+        
+        # Update metadata
+        self.metadata['n_samples'] += 1
+        self.file_manifest.append({
+            'file_id': file_identifier,
+            'path': str(output_file),
+            'shape': attention_map.shape,
+            'saved_at': datetime.now().isoformat()
+        })
+        
+        return output_file
+    
+    def save_batch(self, attention_maps, file_identifiers):
+        """
+        Save a batch of attention maps efficiently.
+        
+        Args:
+            attention_maps: tensor or array of shape (batch_size, n_channels, n_timepoints)
+            file_identifiers: list of file identifiers for each sample in batch
+        
+        Returns:
+            List of saved file paths
+        """
+        if torch.is_tensor(attention_maps):
+            attention_maps = attention_maps.cpu().numpy()
+        
+        saved_paths = []
+        for i, file_id in enumerate(file_identifiers):
+            path = self.save_attention_map(attention_maps[i], file_id, validate=True)
+            saved_paths.append(path)
+        
+        return saved_paths
+    
+    def save_metadata(self):
+        """Save metadata and manifest to JSON."""
+        metadata_file = self.output_dir / 'metadata.json'
+        with open(metadata_file, 'w') as f:
+            json.dump(self.metadata, f, indent=2)
+        
+        manifest_file = self.output_dir / 'manifest.json'
+        with open(manifest_file, 'w') as f:
+            json.dump(self.file_manifest, f, indent=2)
+        
+        print(f"Saved metadata: {self.metadata['n_samples']} attention maps")
+        return metadata_file, manifest_file
+    
+    @staticmethod
+    def load_attention_map(file_path):
+        """
+        Load a single attention map from disk.
+        
+        Args:
+            file_path: Path to the .npz file
+        
+        Returns:
+            dict with keys: 'attention_map', 'file_id', 'shape', 'sampling_rate'
+        """
+        data = np.load(file_path, allow_pickle=False)
+        return {
+            'attention_map': data['attention_map'],
+            'file_id': str(data['file_id']),
+            'shape': tuple(data['shape']),
+            'sampling_rate': float(data['sampling_rate'])
+        }
+
 # ----------------- Training Statistics Tracker -----------------
 class TrainingStatistics:
-    """Comprehensive tracker for all training metrics and statistics."""
+    """
+    Tracks training metrics and statistics.
+    
+    DOES NOT store:
+    - Attention maps (use AttentionMapStorage instead)
+    - Model weights per epoch (only best checkpoint is saved)
+    - Redundant data
+    
+    DOES store:
+    - Epoch-level metrics (loss, accuracy, F1, etc.)
+    - Predictions and labels for analysis
+    - Confusion matrices
+    - Class distributions
+    """
     
     def __init__(self, output_dir='training_stats'):
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(exist_ok=True, parents=True)
         
-        # Initialize storage containers
+        # Initialize storage containers (NO attention_maps, NO model_weights per epoch)
         self.epoch_stats = []
-        self.batch_stats = []
-        self.attention_maps = defaultdict(list)
-        self.model_weights = []
         self.class_distributions = []
-        self.gaze_stats = []
         self.confusion_matrices = []
         self.predictions = defaultdict(list)
         
         # Create timestamp for this run
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = self.output_dir / f"run_{self.timestamp}"
-        self.run_dir.mkdir(exist_ok=True)
+        self.run_dir.mkdir(exist_ok=True, parents=True)
         
-    def record_epoch(self, epoch, train_stats, eval_stats, model=None):
-        """Record comprehensive epoch statistics."""
+    def record_epoch(self, epoch, train_stats, eval_stats):
+        """
+        Record epoch-level statistics.
+        
+        Args:
+            epoch: Current epoch number
+            train_stats: Dictionary of training metrics
+            eval_stats: Dictionary of evaluation metrics
+        
+        Returns:
+            Recorded epoch data dictionary
+        """
         epoch_data = {
             'epoch': epoch,
             'train_loss': train_stats.get('loss', 0),
@@ -500,9 +680,9 @@ class TrainingStatistics:
             'train_gaze_loss': train_stats.get('gaze_loss', 0),
             'train_acc': train_stats.get('acc', 0),
             'eval_acc': eval_stats.get('acc', 0),
-            'eval_loss': eval_stats.get('loss', 0),  # ADD THIS LINE
-            'eval_cls_loss': eval_stats.get('cls_loss', 0),  # ADD THIS LINE
-            'eval_gaze_loss': eval_stats.get('gaze_loss', 0),  # ADD THIS LINE
+            'eval_loss': eval_stats.get('loss', 0),
+            'eval_cls_loss': eval_stats.get('cls_loss', 0),
+            'eval_gaze_loss': eval_stats.get('gaze_loss', 0),
             'eval_macro_f1': eval_stats.get('macro_f1', 0),
             'eval_balanced_acc': eval_stats.get('balanced_acc', 0),
             'eval_weighted_f1': eval_stats.get('weighted_f1', 0),
@@ -511,46 +691,17 @@ class TrainingStatistics:
             'lr': train_stats.get('lr', 0),
             'train_gaze_batches': train_stats.get('gaze_batches', 0),
             'train_gaze_samples': train_stats.get('gaze_samples', 0),
-            'eval_gaze_batches': eval_stats.get('gaze_batches', 0),  # ADD THIS LINE
+            'eval_gaze_batches': eval_stats.get('gaze_batches', 0),
             'timestamp': datetime.now().isoformat()
         }
         self.epoch_stats.append(epoch_data)
         
-        # Store model weights if requested
-        if model is not None:
-            self._record_model_weights(model, epoch)
-        
-        # Save intermediate results
+        # Save intermediate results (CSV only, no large objects)
         self._save_intermediate_results()
         
         return epoch_data
     
-    def record_batch(self, batch_idx, batch_stats):
-        """Record batch-level statistics."""
-        batch_data = {
-            'batch_idx': batch_idx,
-            **batch_stats
-        }
-        self.batch_stats.append(batch_data)
-    
-    def record_attention_maps(self, batch_files, attention_maps, labels, predictions, gaze_maps=None):
-        """Store attention maps for later analysis."""
-        batch_data = []
-        for i, file in enumerate(batch_files):
-            att_map = attention_maps[i].cpu().numpy() if torch.is_tensor(attention_maps[i]) else attention_maps[i]
-            gaze_map = gaze_maps[i].cpu().numpy() if gaze_maps is not None and i < len(gaze_maps) else None
-            
-            sample_data = {
-                'file': file,
-                'attention_map': att_map,
-                'label': labels[i].item() if torch.is_tensor(labels[i]) else labels[i],
-                'prediction': predictions[i].item() if torch.is_tensor(predictions[i]) else predictions[i],
-                'gaze_map': gaze_map,
-                'timestamp': datetime.now().isoformat()
-            }
-            batch_data.append(sample_data)
-        
-        self.attention_maps['samples'].extend(batch_data)
+
     
     def record_class_distribution(self, dataloader, name="train"):
         """Record class distribution in a dataloader."""
@@ -601,112 +752,85 @@ class TrainingStatistics:
             }
             self.predictions[dataset].append(pred_data)
     
-    def _record_model_weights(self, model, epoch):
-        """Record model weights and gradients for analysis."""
-        weight_data = {'epoch': epoch, 'weights': {}, 'gradients': {}}
-        
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                weight_data['weights'][name] = {
-                    'mean': param.data.mean().item(),
-                    'std': param.data.std().item(),
-                    'min': param.data.min().item(),
-                    'max': param.data.max().item()
-                }
-                if param.grad is not None:
-                    weight_data['gradients'][name] = {
-                        'mean': param.grad.mean().item(),
-                        'std': param.grad.std().item(),
-                        'norm': param.grad.norm().item()
-                    }
-        
-        self.model_weights.append(weight_data)
+
     
     def _save_intermediate_results(self):
-        """Save intermediate results to disk."""
+        """Save intermediate results to disk (CSV format only)."""
         # Save epoch stats
         if self.epoch_stats:
             pd.DataFrame(self.epoch_stats).to_csv(self.run_dir / 'epoch_stats.csv', index=False)
-        
-        # Save batch stats (sampled to avoid huge files)
-        if self.batch_stats and len(self.batch_stats) > 1000:
-            # Save only every 10th batch
-            sampled_batch_stats = self.batch_stats[::10]
-            pd.DataFrame(sampled_batch_stats).to_csv(self.run_dir / 'batch_stats_sampled.csv', index=False)
-        
-        # Save class distributions
-        if self.class_distributions:
-            with open(self.run_dir / 'class_distributions.pkl', 'wb') as f:
-                pickle.dump(self.class_distributions, f)
     
-    def save_final_results(self, model=None, attention_maps=None):
-        """Save all collected statistics to disk."""
+    def save_final_results(self):
+        """
+        Save all collected statistics to disk.
+        
+        Saves:
+        - Epoch statistics (CSV)
+        - Training plots (PNG)
+        - Class distributions (CSV)
+        - Confusion matrices (JSON)
+        - Predictions (CSV)
+        - Metadata (JSON)
+        
+        Does NOT save:
+        - Attention maps (use AttentionMapStorage)
+        - Model checkpoints (saved separately as best_model.pth)
+        """
         print(f"\nSaving training statistics to: {self.run_dir}")
         
         # 1. Save epoch statistics
-        epoch_df = pd.DataFrame(self.epoch_stats)
-        epoch_df.to_csv(self.run_dir / 'epoch_statistics.csv', index=False)
+        if self.epoch_stats:
+            epoch_df = pd.DataFrame(self.epoch_stats)
+            epoch_df.to_csv(self.run_dir / 'epoch_statistics.csv', index=False)
+            print(f"  ✓ Saved epoch statistics ({len(self.epoch_stats)} epochs)")
         
         # 2. Save training history plots
         self._create_training_plots()
+        print(f"  ✓ Saved training plots")
         
-        # 3. Save attention maps
-        if attention_maps:
-            with open(self.run_dir / 'attention_maps.pkl', 'wb') as f:
-                pickle.dump(attention_maps, f)
-            print(f"  - Saved attention maps")
-        
-        # 4. Save model weights history
-        if self.model_weights:
-            with open(self.run_dir / 'model_weights_history.pkl', 'wb') as f:
-                pickle.dump(self.model_weights, f)
-        
-        # 5. Save class distributions
+        # 3. Save class distributions (JSON, not pickle)
         if self.class_distributions:
-            class_dist_df = pd.DataFrame(self.class_distributions)
-            class_dist_df.to_csv(self.run_dir / 'class_distributions.csv', index=False)
+            with open(self.run_dir / 'class_distributions.json', 'w') as f:
+                json.dump(self.class_distributions, f, indent=2)
+            print(f"  ✓ Saved class distributions")
         
-        # 6. Save confusion matrices
+        # 4. Save confusion matrices (JSON, not pickle)
         if self.confusion_matrices:
-            with open(self.run_dir / 'confusion_matrices.pkl', 'wb') as f:
-                pickle.dump(self.confusion_matrices, f)
+            # Convert numpy arrays to lists for JSON serialization
+            cm_serializable = []
+            for cm in self.confusion_matrices:
+                cm_copy = cm.copy()
+                if 'matrix' in cm_copy and isinstance(cm_copy['matrix'], np.ndarray):
+                    cm_copy['matrix'] = cm_copy['matrix'].tolist()
+                cm_serializable.append(cm_copy)
+            
+            with open(self.run_dir / 'confusion_matrices.json', 'w') as f:
+                json.dump(cm_serializable, f, indent=2)
+            print(f"  ✓ Saved confusion matrices")
         
-        # 7. Save predictions
+        # 5. Save predictions
         for dataset_name, pred_list in self.predictions.items():
             if pred_list:
                 pred_df = pd.DataFrame(pred_list)
                 pred_df.to_csv(self.run_dir / f'predictions_{dataset_name}.csv', index=False)
+                print(f"  ✓ Saved predictions for {dataset_name} ({len(pred_list)} samples)")
         
-        # 8. Save gaze statistics
-        if self.gaze_stats:
-            gaze_df = pd.DataFrame(self.gaze_stats)
-            gaze_df.to_csv(self.run_dir / 'gaze_statistics.csv', index=False)
-        
-        # 9. Save configuration and metadata
+        # 6. Save configuration and metadata
         metadata = {
             'timestamp': self.timestamp,
             'total_epochs': len(self.epoch_stats),
-            'total_batches': len(self.batch_stats),
-            'total_attention_maps': len(self.attention_maps.get('samples', [])),
-            'run_directory': str(self.run_dir)
+            'run_directory': str(self.run_dir),
+            'storage_format': 'CSV and JSON (no pickle)',
+            'note': 'Attention maps stored separately in attention_maps/ directory'
         }
         with open(self.run_dir / 'metadata.json', 'w') as f:
             json.dump(metadata, f, indent=2)
+        print(f"  ✓ Saved metadata")
         
-        # 10. Save model architecture and final state
-        if model is not None:
-            torch.save(model.state_dict(), self.run_dir / 'final_model.pth')
-            # Save model summary
-            with open(self.run_dir / 'model_summary.txt', 'w') as f:
-                f.write(str(model))
-                f.write(f"\n\nTotal parameters: {sum(p.numel() for p in model.parameters())}")
-                f.write(f"\nTrainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-        
-        print(f"Training statistics saved successfully!")
-        print(f"  - CSV files: epoch_statistics.csv, class_distributions.csv")
-        print(f"  - Attention maps: attention_maps.pkl")
-        print(f"  - Plots: training_*.png")
-        print(f"  - Model: final_model.pth")
+        print(f"\nTraining statistics saved successfully!")
+        print(f"  Location: {self.run_dir}")
+        print(f"  Files: epoch_statistics.csv, predictions_*.csv, confusion_matrices.json")
+        print(f"  Plots: training_curves.png, confusion_matrix.png")
     
     def _create_training_plots(self):
         """Create visualization plots from training statistics."""
@@ -904,18 +1028,7 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=1,
         correct += (preds == labels).sum().item()
         total += labels.size(0)
         
-        # Record batch statistics ONLY (NO attention maps during training)
-        if stats_tracker:
-            batch_stats = {
-                'epoch': epoch,
-                'batch_loss': loss.item(),
-                'batch_cls_loss': cls_loss.item(),
-                'batch_gaze_loss': gaze_loss.item() if has_gaze else 0.0,
-                'batch_accuracy': (preds == labels).float().mean().item(),
-                'has_gaze': has_gaze,
-                'lr': current_lr
-            }
-            stats_tracker.record_batch(batch_idx, batch_stats)
+        # No batch-level storage during training (only epoch-level metrics)
         
         # Update progress bar
         pbar.set_postfix({
@@ -1048,50 +1161,74 @@ def evaluate_model_comprehensive(model, eval_loader, device, stats_tracker=None,
     
     return eval_stats, all_labels, all_preds, all_files
 
-# ----------------- Function to Collect All Attention Maps -----------------
-def collect_eval_attention_maps(model, eval_loader, device):
+# ----------------- Function to Collect and Save Attention Maps -----------------
+def collect_and_save_attention_maps(model, eval_loader, device, output_dir='attention_maps'):
     """
-    Collect attention maps (and gaze maps if present) from eval set.
-    Stores ONLY what is needed for later comparison.
+    Collect attention maps from eval set and save them efficiently.
+    
+    Memory-efficient: Processes one batch at a time and saves to disk immediately.
+    Does NOT accumulate all attention maps in memory.
+    
+    Args:
+        model: Trained model
+        eval_loader: DataLoader for evaluation set
+        device: torch device
+        output_dir: Directory to save attention maps
+    
+    Returns:
+        AttentionMapStorage instance with metadata
     """
     model.eval()
-    stored_data = []
-
+    storage = AttentionMapStorage(output_dir=output_dir)
+    
+    print(f"\nCollecting attention maps from evaluation set...")
+    print(f"Output directory: {storage.output_dir}")
+    
+    total_samples = 0
+    
     with torch.no_grad():
-        for batch in eval_loader:
+        for batch_idx, batch in enumerate(tqdm(eval_loader, desc="Saving attention maps")):
             eeg = batch['eeg'].to(device)
-
-            # file identifiers (for traceability)
+            
+            # Get file identifiers
             batch_files = []
             if 'file' in batch:
                 for f in batch['file']:
                     if isinstance(f, (bytes, bytearray)):
                         f = f.decode('utf-8', errors='ignore')
                     batch_files.append(os.path.basename(str(f)))
-
-            # forward pass WITH attention
+            else:
+                # Fallback: use batch index
+                batch_files = [f"sample_{batch_idx}_{i}" for i in range(eeg.size(0))]
+            
+            # Forward pass WITH attention
             outputs = model(eeg, return_attention=True)
-
-            # handle your model's return format
-            attention_map = outputs['attention_map']  # [B, 22, 15000]
-
+            
+            # Handle model's return format
+            if isinstance(outputs, dict):
+                attention_map = outputs['attention_map']
+            elif isinstance(outputs, tuple):
+                _, attention_map = outputs
+            else:
+                raise RuntimeError("Model must return attention map when return_attention=True")
+            
             if attention_map is None:
                 raise RuntimeError("Attention map was not returned by the model")
-
-            # per-sample storage
-            for i in range(attention_map.size(0)):
-                sample = {
-                    'file': batch_files[i] if i < len(batch_files) else f"sample_{i}",
-                    'attention_map': attention_map[i].cpu().numpy()
-                }
-
-                # OPTIONAL: gaze map (if provided by dataset)
-                if 'gaze' in batch and batch['gaze'] is not None:
-                    sample['gaze_map'] = batch['gaze'][i].cpu().numpy()
-
-                stored_data.append(sample)
-
-    return stored_data
+            
+            # Save batch immediately (memory-efficient)
+            storage.save_batch(attention_map, batch_files)
+            total_samples += len(batch_files)
+    
+    # Save metadata and manifest
+    storage.save_metadata()
+    
+    print(f"\n✓ Successfully saved {total_samples} attention maps")
+    print(f"  Format: Compressed NPZ (numpy.savez_compressed)")
+    print(f"  Shape per map: {storage.metadata['expected_shape']}")
+    print(f"  Total files: {len(storage.file_manifest)}")
+    print(f"  Location: {storage.output_dir}")
+    
+    return storage
 
 
 # ----------------- Updated Main Function -----------------
@@ -1217,13 +1354,12 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         )
         
         # Evaluate
-
         eval_stats, ev_labels, ev_preds, ev_files = evaluate_model_comprehensive(
             model, eval_loader, device, stats_tracker, "eval"
         )
         
-        # Record epoch statistics (pass eval_stats with losses)
-        epoch_data = stats_tracker.record_epoch(epoch, train_stats, eval_stats, model)
+        # Record epoch statistics (NO model weights storage)
+        epoch_data = stats_tracker.record_epoch(epoch, train_stats, eval_stats)
         # Compute metrics for scheduler
         metric_for_sched = eval_stats['loss']
         scheduler.step(metric_for_sched)
@@ -1247,80 +1383,124 @@ def main(lr=1e-4, epochs=50, batch_size=32, accum_iter=1,
         # Detailed classification report
         print("\nClassification Report:")
         print(classification_report(ev_labels, ev_preds, digits=4))
+        # Track best metrics
         if eval_stats['acc'] > best_acc:
             best_acc = eval_stats['acc']
-        # Save best model based on accuracy
+        
+        # Save SINGLE authoritative checkpoint (based on validation loss)
         if eval_stats['loss'] < best_loss:
             best_loss = eval_stats['loss']
+            checkpoint_path = stats_tracker.run_dir / 'best_model.pth'
             torch.save({
+                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(), 
-            }, 'best_model_gaze_attention_fixed.pth')
-            print(f"  Saved best model at epoch {epoch+1} "
-f"(val_loss {best_loss:.4f})"
-    )
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_stats['loss'],
+                'eval_loss': eval_stats['loss'],
+                'eval_acc': eval_stats['acc'],
+                'eval_f1': eval_stats['macro_f1'],
+            }, checkpoint_path)
+            print(f"  ✓ Saved best model checkpoint (val_loss: {best_loss:.4f}, epoch: {epoch+1})")
     
-    # Load best model
+    # Load best model checkpoint
+    checkpoint_path = stats_tracker.run_dir / 'best_model.pth'
     try:
-        if os.path.exists('best_model_gaze_attention_fixed.pth'):
-            checkpoint = torch.load('best_model_gaze_attention_fixed.pth')
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path)
             model.load_state_dict(checkpoint['model_state_dict'])
-            print("\nLoaded best model from disk for final evaluation.")
+            print(f"\n✓ Loaded best model checkpoint from epoch {checkpoint['epoch']}")
+            print(f"  Validation loss: {checkpoint['eval_loss']:.4f}")
+            print(f"  Validation accuracy: {checkpoint['eval_acc']:.2f}%")
     except Exception as e:
-        print("Could not load best model:", e)
+        print(f"Warning: Could not load best model checkpoint: {e}")
     
-    # Collect attention maps for evaluation set
+    # Save training statistics
     print("\n" + "=" * 80)
-    print("COLLECTING ATTENTION MAPS FOR EVALUATION SET (AFTER TRAINING)")
+    print("SAVING TRAINING STATISTICS")
+    print("=" * 80)
+    stats_tracker.save_final_results()
+    
+    # Collect and save attention maps SEPARATELY (memory-efficient)
+    print("\n" + "=" * 80)
+    print("COLLECTING AND SAVING ATTENTION MAPS")
     print("=" * 80)
     
-    eval_attention_maps = collect_eval_attention_maps(
-        model, eval_loader, device
+    attention_storage = collect_and_save_attention_maps(
+        model=model,
+        eval_loader=eval_loader,
+        device=device,
+        output_dir=stats_tracker.run_dir / 'attention_maps'
     )
     
-    # Combine all attention maps
-    all_attention_maps = {
-        'eval_final': eval_attention_maps,
-        'metadata': {
-            'total_eval_samples': len(eval_attention_maps),
-            'collection_timestamp': datetime.now().isoformat()
-        }
-    }
-    
-    # Add to stats tracker
-    stats_tracker.attention_maps = all_attention_maps
-    
-    # Save all results
-    print("\n" + "=" * 80)
-    print("SAVING ALL TRAINING RESULTS")
-    print("=" * 80)
-    
-    stats_tracker.save_final_results(model=model, attention_maps=all_attention_maps)
-    
-    # Save a summary report with parameters
-    with open(stats_tracker.run_dir / 'training_summary.txt', 'w') as f:
+    # Create comprehensive summary report
+    summary_path = stats_tracker.run_dir / 'training_summary.txt'
+    with open(summary_path, 'w') as f:
+        f.write("=" * 80 + "\n")
         f.write("TRAINING SUMMARY REPORT\n")
-        f.write("=" * 50 + "\n\n")
+        f.write("=" * 80 + "\n\n")
+        
         f.write(f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total epochs: {len(stats_tracker.epoch_stats)}\n")
-        f.write(f"Best evaluation accuracy: {best_acc:.2f}%\n")
-        f.write(f"\nTraining Parameters:\n")
+        f.write(f"Best validation accuracy: {best_acc:.2f}%\n")
+        f.write(f"Best validation loss: {best_loss:.4f}\n\n")
+        
+        f.write("TRAINING PARAMETERS\n")
+        f.write("-" * 40 + "\n")
         f.write(f"  Learning rate: {lr}\n")
         f.write(f"  Epochs: {epochs}\n")
         f.write(f"  Batch size: {batch_size}\n")
         f.write(f"  Accumulation steps: {accum_iter}\n")
         f.write(f"  Gaze weight: {gaze_weight}\n")
-        f.write(f"  Gaze loss type: {gaze_loss_type}\n")
-        f.write(f"\nDataset Statistics:\n")
+        f.write(f"  Gaze loss type: {gaze_loss_type}\n\n")
+        
+        f.write("DATASET STATISTICS\n")
+        f.write("-" * 40 + "\n")
         f.write(f"  Train samples: {len(train_loader.dataset)}\n")
         f.write(f"  Eval samples: {len(eval_loader.dataset)}\n")
         f.write(f"  Train class distribution: {dict(train_dist)}\n")
-        f.write(f"  Eval class distribution: {dict(eval_dist)}\n")
-        f.write(f"\nResults saved to: {stats_tracker.run_dir}\n")
+        f.write(f"  Eval class distribution: {dict(eval_dist)}\n\n")
+        
+        f.write("STORAGE ARCHITECTURE\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"  Training stats: {stats_tracker.run_dir}\n")
+        f.write(f"    - epoch_statistics.csv (epoch-level metrics)\n")
+        f.write(f"    - predictions_eval.csv (per-sample predictions)\n")
+        f.write(f"    - confusion_matrices.json (evaluation confusion matrices)\n")
+        f.write(f"    - training_curves.png (loss/accuracy plots)\n")
+        f.write(f"  Model checkpoint: {checkpoint_path}\n")
+        f.write(f"  Attention maps: {attention_storage.output_dir}\n")
+        f.write(f"    - Format: Compressed NPZ (one file per sample)\n")
+        f.write(f"    - Count: {attention_storage.metadata['n_samples']} maps\n")
+        f.write(f"    - Shape per map: {attention_storage.metadata['expected_shape']}\n\n")
+        
+        f.write("DESIGN PRINCIPLES\n")
+        f.write("-" * 40 + "\n")
+        f.write("  ✓ No duplicate storage (attention maps saved once)\n")
+        f.write("  ✓ No pickle for large arrays (NPZ with compression)\n")
+        f.write("  ✓ Separated training stats from analysis artifacts\n")
+        f.write("  ✓ Single authoritative checkpoint (best validation loss)\n")
+        f.write("  ✓ Memory-efficient processing (batch-by-batch)\n")
+        f.write("  ✓ All artifacts are independently reloadable\n\n")
+        
+        f.write("INVARIANTS\n")
+        f.write("-" * 40 + "\n")
+        f.write("  Attention map shape: (22, 15000) [channels × timepoints]\n")
+        f.write("  Attention map dtype: float32\n")
+        f.write("  Attention map range: [0, 1] (normalized)\n")
+        f.write("  EEG sampling rate: 50 Hz\n")
+        f.write("  Temporal resolution: 15000 samples = 300 seconds\n")
     
-    print("\nTraining complete!")
-    print(f"Best evaluation accuracy: {best_acc:.2f}%")
-    print(f"All results saved to: {stats_tracker.run_dir}")
+    print("\n" + "=" * 80)
+    print("TRAINING COMPLETE!")
+    print("=" * 80)
+    print(f"Best validation accuracy: {best_acc:.2f}%")
+    print(f"Best validation loss: {best_loss:.4f}")
+    print(f"\nResults saved to: {stats_tracker.run_dir}")
+    print(f"  - Training statistics: epoch_statistics.csv, predictions_eval.csv")
+    print(f"  - Model checkpoint: best_model.pth")
+    print(f"  - Attention maps: attention_maps/ ({attention_storage.metadata['n_samples']} files)")
+    print(f"  - Summary: training_summary.txt")
+    print("=" * 80)
     
     return best_acc, stats_tracker.run_dir
 
