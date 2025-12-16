@@ -52,3 +52,6 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints
 *.ipynb
+
+# Test files
+test_*.py
